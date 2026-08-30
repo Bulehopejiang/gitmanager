@@ -81,6 +81,14 @@ def normalize_git_result(result) -> tuple[int, str, str]:
     return (0, msg, "") if ok else (1, "", msg)
 
 
+def _is_network_error(text: str) -> bool:
+    """判断报错是否为"连不上远程服务器"这类网络问题。"""
+    keywords = ("Failed to connect", "Could not connect", "unable to access",
+                "Could not resolve host", "Connection timed out",
+                "连接超时", "无法连接")
+    return any(k in text for k in keywords)
+
+
 def load_config() -> dict:
     """读取配置文件（不存在则返回空字典）。"""
     if CONFIG_FILE.exists():
@@ -950,6 +958,10 @@ class App(tk.Tk):
         统一用 normalize_git_result 归一化，避免解包失败。
         """
         code, out, err = normalize_git_result(fn(self.git))
+        if not diff_only and err and _is_network_error(err):
+            # 网络连不上远程时给出可操作的提示（国内访问 GitHub 常见）
+            err += ("\n提示：无法连接远程服务器，请检查网络；"
+                    "若需要代理，请先执行：git config --global http.proxy http://127.0.0.1:代理端口")
         if diff_only:
             return {"action": "diff", "code": code, "out": out, "err": err,
                     "file": file}
