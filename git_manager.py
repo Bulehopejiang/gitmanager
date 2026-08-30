@@ -125,11 +125,22 @@ class Git:
         cmd = ["git"]
         if self.repo_dir is not None:
             cmd += ["-C", str(self.repo_dir)]
-        cmd += ["-c", "core.quotepath=false", *args]
+        # http.connectTimeout / lowSpeed*：网络卡顿时约 30 秒内报错，
+        # 避免推送/拉取长时间"没反应"（默认可能挂 5 分钟）
+        cmd += ["-c", "core.quotepath=false",
+                "-c", "http.connectTimeout=30",
+                "-c", "http.lowSpeedLimit=1000",
+                "-c", "http.lowSpeedTime=30",
+                *args]
         try:
+            # GIT_TERMINAL_PROMPT=0 + 无标准输入：禁止 git 交互式询问用户名/密码。
+            # 否则推送 https 远程且未配置凭据时，git 会阻塞在等输入上，界面表现为"点了没反应"。
+            env = os.environ.copy()
+            env["GIT_TERMINAL_PROMPT"] = "0"
             proc = subprocess.run(
                 cmd, capture_output=True, timeout=timeout,
                 creationflags=CREATE_NO_WINDOW,
+                stdin=subprocess.DEVNULL, env=env,
             )
         except subprocess.TimeoutExpired:
             return 1, "", f"命令超时（>{timeout}s）：git {' '.join(args)}"
@@ -261,7 +272,10 @@ class Git:
                                   f"HEAD:{branch}")
         if code == 0:
             return True, out or f"已推送到 {name}"
-        if "Authentication failed" in err or "401" in err or "403" in err:
+        if ("Authentication failed" in err or "401" in err or "403" in err
+                or "could not read Username" in err
+                or "terminal prompts disabled" in err
+                or "authentication failed" in err.lower()):
             return False, (err + "\n提示：认证失败，请在「Token 设置」中配置 GitHub Token。")
         return False, err or out
 
@@ -507,19 +521,29 @@ class App(tk.Tk):
             btn.configure(state=state)
 
     def _poll_queue(self) -> None:
-        """定期把后台线程的结果取回主线程处理。"""
+        """定期把后台线程的结果取回主线程处理。
+
+        用 try/finally 保证轮询永远继续：任何一条消息处理出错都不能
+        让界面卡死（否则 busy 会一直为 True，按钮全部失灵）。
+        """
         try:
-            while True:
-                kind, payload = self._queue.get_nowait()
-                if kind == "error":
-                    self._print(f"后台任务异常：{payload}", "err")
-                    self._set_status("任务异常")
-                    self._set_busy(False)
-                else:
-                    self._dispatch(payload)
-        except queue.Empty:
-            pass
-        self.after(60, self._poll_queue)
+            try:
+                while True:
+                    kind, payload = self._queue.get_nowait()
+                    if kind == "error":
+                        self._print(f"后台任务异常：{payload}", "err")
+                        self._set_status("任务异常")
+                        self._set_busy(False)
+                    else:
+                        try:
+                            self._dispatch(payload)
+                        except Exception as exc:  # noqa: BLE001
+                            self._print(f"界面刷新异常：{exc}", "err")
+                            self._set_busy(False)
+            except queue.Empty:
+                pass
+        finally:
+            self.after(60, self._poll_queue)
 
     def _dispatch(self, payload: dict) -> None:
         """按 action 字段把后台结果分发给对应收尾函数。"""
@@ -736,6 +760,12 @@ class App(tk.Tk):
         """推送到远程。"""
         if not self._require_repo():
             return
+        # 未配置 Token 且远程是 https 时，提前提示，避免用户以为没反应
+        remotes = self.git.remotes()
+        if (remotes and remotes[0][1].startswith("https://")
+                and not self.cfg.get("github_token")):
+            self._print("提示：远程是 https 且未配置 Token，推送会认证失败或弹出系统登录窗口。"
+                        "建议先在「Token 设置」中配置 GitHub Token。", "err")
         self._run_console(lambda g: g.push(), "git push", "推送")
 
     def on_pull(self) -> None:
