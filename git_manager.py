@@ -601,15 +601,22 @@ class App(tk.Tk):
         self.statusbar.configure(text=f"分支：{branch}　|　{text}")
 
     def _set_busy(self, busy: bool) -> None:
-        """忙时禁用全部操作按钮，防止同时跑多个 git 命令。"""
+        """标记"有任务在跑"。
+
+        注意：**不禁用按钮** —— 按钮置灰时点击会完全无反应，用户会以为软件坏了。
+        改为按钮保持可点，由 _busy_blocked() 在执行前给出明确提示，
+        防重复执行由该检查保证（效果等同，但用户能看到反馈）。
+        """
         self.busy = busy
-        if busy:
-            self._busy_since = time.time()   # 看门狗：记录开始时间
-        else:
-            self._busy_since = None
-        state = "disabled" if busy else "normal"
-        for btn in self.buttons.values():
-            btn.configure(state=state)
+        self._busy_since = time.time() if busy else None
+
+    def _busy_blocked(self) -> bool:
+        """有任务在跑时阻止新操作，并提示用户（返回 True 表示已被拦下）。"""
+        if self.busy:
+            self._print("当前有任务在运行，请稍候再操作……", "info")
+            self._set_status("正忙（请稍候）")
+            return True
+        return False
 
     def _check_busy_watchdog(self) -> None:
         """看门狗：任务卡死（超过 120 秒无结果）时强制恢复界面。
@@ -774,6 +781,8 @@ class App(tk.Tk):
 
     def on_init(self) -> None:
         """在地址栏目录初始化 git 仓库。"""
+        if self._busy_blocked():
+            return
         text = self.addr_var.get().strip().strip('"')
         if not text or is_git_url(text):
             messagebox.showinfo(APP_NAME, "请先输入要初始化仓库的本地文件夹路径")
@@ -1058,6 +1067,8 @@ class App(tk.Tk):
         """打开提交对话框。"""
         if not self._require_repo():
             return
+        if self._busy_blocked():
+            return
         CommitDialog(self)
 
     def on_push(self) -> None:
@@ -1091,6 +1102,8 @@ class App(tk.Tk):
     def on_stash(self) -> None:
         """暂存当前所有改动（含未跟踪文件）。"""
         if not self._require_repo():
+            return
+        if self._busy_blocked():
             return
         if not messagebox.askyesno(APP_NAME, "暂存当前所有改动？\n（工作区会变干净，可随时恢复）"):
             return
@@ -1195,6 +1208,8 @@ class App(tk.Tk):
         """版本回溯：把仓库恢复到历史中的某个版本。"""
         if not self._require_repo():
             return
+        if self._busy_blocked():
+            return
         sel = self.log_tree.selection()
         if not sel:
             messagebox.showinfo(APP_NAME, "请在「提交历史」页签中先选择一个版本")
@@ -1260,6 +1275,8 @@ class App(tk.Tk):
         """切换分支。"""
         if not self._require_repo():
             return
+        if self._busy_blocked():
+            return
         branches = self.git.branches()
         if not branches:
             messagebox.showinfo(APP_NAME, "仓库还没有分支")
@@ -1300,11 +1317,10 @@ class App(tk.Tk):
     def _run_console(self, fn, cmd_text: str, status_text: str,
                      diff_only: bool = False, file: str = "") -> None:
         """在后台跑一个 git 命令，把结果打到控制台/差异页，然后轻量刷新。"""
-        if self.busy:
-            self._print("当前有任务在运行，请稍候再操作……", "info")
+        if self._busy_blocked():
             return
         self._set_busy(True)
-        self._set_status(f"{status_text}中…（按钮暂不可用）")
+        self._set_status(f"{status_text}中…")
         self._print(f"$ {cmd_text}", "cmd")
         Worker(self._queue, self._work_console, fn, status_text,
                diff_only, file).start()
@@ -1504,7 +1520,19 @@ class App(tk.Tk):
         return items
 
     def _render(self, payload: dict) -> None:
-        """用后台抓取的数据刷新各面板。"""
+        """用后台抓取的数据刷新各面板。
+
+        刷新会重建列表，因此先记住原来的选中项、刷新后恢复 —— 否则每次
+        自动刷新都会把选中清空，导致"选中文件 → 刷新 → 点查看差异没反应"。
+        """
+        prev_status = [self.status_tree.item(i, "values")[1]
+                       for i in self.status_tree.selection()]
+        prev_log = [self.log_tree.item(i, "values")[0]
+                    for i in self.log_tree.selection()]
+        prev_branch = [self.branch_tree.item(i, "values")[1]
+                       for i in self.branch_tree.selection()]
+        prev_tree = list(self.tree.selection())
+
         # 文件树
         self.tree.delete(*self.tree.get_children())
         for parent, iid, name, tag in payload["tree"]:
@@ -1524,6 +1552,18 @@ class App(tk.Tk):
         for name, is_cur, msg in payload["branches"]:
             self.branch_tree.insert("", "end",
                                     values=("●" if is_cur else "", name, msg))
+        # 恢复刷新前的选中项（还在列表里的就重新选中）
+        for i in self.status_tree.get_children():
+            if self.status_tree.item(i, "values")[1] in prev_status:
+                self.status_tree.selection_add(i)
+        for i in self.log_tree.get_children():
+            if self.log_tree.item(i, "values")[0] in prev_log:
+                self.log_tree.selection_add(i)
+        for i in self.branch_tree.get_children():
+            if self.branch_tree.item(i, "values")[1] in prev_branch:
+                self.branch_tree.selection_add(i)
+        if prev_tree and self.tree.exists(prev_tree[0]):
+            self.tree.selection_set(prev_tree[0])
         # 状态栏
         remote = ""
         if self.git:
