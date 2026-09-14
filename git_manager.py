@@ -6,6 +6,7 @@
   - GitHub 提交：配置 Token 后即可 commit + push 到 GitHub
   - 版本回溯：在历史列表中选择某个版本，可软/硬回溯或检出到新分支
   - 实体仓库文件结构树（带变更标记），右侧输出控制台显示每次 git 命令结果
+  - 打开/刷新仓库时，自动把抓取到的变更信息写入该仓库文件夹的「仓库变更信息.txt」
 
 运行方式：
     python git_manager.py                 # 打开图形界面
@@ -53,6 +54,10 @@ STATUS_STYLE = {
     "??": ("未跟踪", "#2563eb"),   # 未跟踪新文件
     "U":  ("冲突", "#dc2626"),     # 合并冲突
 }
+
+# 打开/刷新仓库后，把抓取到的变更信息写入各仓库自己的文件夹（报告文件）
+REPORT_FILENAME = "仓库变更信息.txt"   # 报告文件名，生成在仓库根目录
+REPORT_COMMIT_LIMIT = 10               # 报告里最多展示的提交条数
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +330,12 @@ class App(tk.Tk):
         self.repo_dir: Path | None = None      # 当前打开的仓库目录
         self.git: Git | None = None
         self.busy = False                      # 是否有后台任务在跑
+        self._busy_since: float | None = None  # 看门狗：当前任务开始时间
+        self._pending_open: str | None = None  # 忙碌期间排队等待打开的地址
         self._queue: queue.Queue = queue.Queue()
+
+        # 界面回调里的任何异常都弹窗显示（而不是静默"点了没反应"）
+        self.report_callback_exception = self._show_callback_error
 
         # 窗口获得焦点时自动刷新（比如在编辑器改完文件切回本软件）
         self._last_auto_refresh = 0.0
@@ -344,6 +354,17 @@ class App(tk.Tk):
             if code == 0:
                 self.addr_var.set(last)
                 self.open_repo(Path(last), quiet=True)
+
+    def _show_callback_error(self, exc, val, tb) -> None:
+        """界面回调异常的统一出口：写控制台 + 弹窗，避免"点了没反应"。"""
+        import traceback
+        detail = "".join(traceback.format_exception(exc, val, tb))
+        self._print(f"界面错误：{val}", "err")
+        self._set_busy(False)  # 出错也要恢复按钮可用
+        try:
+            messagebox.showerror(APP_NAME, f"发生错误：{val}\n\n{detail}")
+        except Exception:  # noqa: BLE001 —— 弹窗失败不能再抛
+            pass
 
     # ------------------------------------------------------------------ UI 构建
     def _build_style(self) -> None:
@@ -374,6 +395,7 @@ class App(tk.Tk):
         addr.bind("<Return>", lambda e: self.on_open_or_clone())
         ttk.Button(toolbar, text="打开 / 克隆", command=self.on_open_or_clone).pack(side="left", padx=2)
         ttk.Button(toolbar, text="初始化仓库", command=self.on_init).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="远程仓库", command=self.on_remote_settings).pack(side="left", padx=2)
         ttk.Button(toolbar, text="Token 设置", command=self.on_token_settings).pack(side="left", padx=2)
 
         # -- 第 2 行：常用 git 操作按钮 ------------------------------------
@@ -435,8 +457,13 @@ class App(tk.Tk):
             self.status_tree.tag_configure(tag, foreground=color)
         row = ttk.Frame(tab_status)
         row.pack(fill="x", padx=4, pady=(0, 4))
-        ttk.Button(row, text="添加所选", command=self.on_add_selected).pack(side="left", padx=2)
-        ttk.Button(row, text="放弃所选修改", command=self.on_discard_selected).pack(side="left", padx=2)
+        # 页签内按钮也纳入 busy 禁用管理，避免任务进行中点了"没反应"
+        self.buttons["add_selected"] = ttk.Button(
+            row, text="添加所选", command=self.on_add_selected)
+        self.buttons["add_selected"].pack(side="left", padx=2)
+        self.buttons["discard_selected"] = ttk.Button(
+            row, text="放弃所选修改", command=self.on_discard_selected)
+        self.buttons["discard_selected"].pack(side="left", padx=2)
         nb.add(tab_status, text="变更")
 
         # 页签 2：提交历史（版本回溯入口）
@@ -455,8 +482,9 @@ class App(tk.Tk):
         self.log_tree.pack(fill="both", expand=True, padx=4, pady=4)
         row2 = ttk.Frame(tab_log)
         row2.pack(fill="x", padx=4, pady=(0, 4))
-        ttk.Button(row2, text="⬅ 回溯到所选版本",
-                   command=self.on_rollback).pack(side="left", padx=2)
+        self.buttons["rollback_tab"] = ttk.Button(
+            row2, text="⬅ 回溯到所选版本", command=self.on_rollback)
+        self.buttons["rollback_tab"].pack(side="left", padx=2)
         ttk.Label(row2, text="提示：选中历史中的某个版本后点击「回溯」",
                   foreground="#6b7280").pack(side="left", padx=8)
         nb.add(tab_log, text="提交历史")
@@ -472,8 +500,9 @@ class App(tk.Tk):
         self.branch_tree.column("name", width=160)
         self.branch_tree.column("msg", width=330)
         self.branch_tree.pack(fill="both", expand=True, padx=4, pady=4)
-        ttk.Button(tab_branch, text="切换到选中分支",
-                   command=self.on_switch_branch).pack(anchor="w", padx=4, pady=(0, 4))
+        self.buttons["switch_branch_tab"] = ttk.Button(
+            tab_branch, text="切换到选中分支", command=self.on_switch_branch)
+        self.buttons["switch_branch_tab"].pack(anchor="w", padx=4, pady=(0, 4))
         nb.add(tab_branch, text="分支")
 
         # 页签 4：差异查看
@@ -524,9 +553,25 @@ class App(tk.Tk):
     def _set_busy(self, busy: bool) -> None:
         """忙时禁用全部操作按钮，防止同时跑多个 git 命令。"""
         self.busy = busy
+        if busy:
+            self._busy_since = time.time()   # 看门狗：记录开始时间
+        else:
+            self._busy_since = None
         state = "disabled" if busy else "normal"
         for btn in self.buttons.values():
             btn.configure(state=state)
+
+    def _check_busy_watchdog(self) -> None:
+        """看门狗：任务卡死（超过 120 秒无结果）时强制恢复界面。
+
+        防止某个后台任务异常挂起导致按钮永久禁用（表现为"点了没反应、
+        对话框不弹出"）。真正的超时仍由各 git 命令自身的超时负责，
+        这里只是兜底保证界面永远可操作。
+        """
+        since = getattr(self, "_busy_since", None)
+        if self.busy and since and (time.time() - since) > 120:
+            self._print("检测到后台任务异常卡住，已强制恢复界面（可重试该操作）。", "err")
+            self._set_busy(False)
 
     def _poll_queue(self) -> None:
         """定期把后台线程的结果取回主线程处理。
@@ -534,6 +579,7 @@ class App(tk.Tk):
         用 try/finally 保证轮询永远继续：任何一条消息处理出错都不能
         让界面卡死（否则 busy 会一直为 True，按钮全部失灵）。
         """
+        self._check_busy_watchdog()
         try:
             try:
                 while True:
@@ -569,6 +615,19 @@ class App(tk.Tk):
             self._show_diff(payload)
         else:
             self._set_status("完成")
+        # 若有排队等待打开的地址，任务结束后自动打开
+        pending = getattr(self, "_pending_open", None)
+        if pending:
+            self._pending_open = None
+            self.after(80, lambda t=pending: self._apply_pending_open(t))
+
+    def _apply_pending_open(self, text: str) -> None:
+        """执行排队中的打开/克隆请求（等待期间又来了新任务则继续排队）。"""
+        if self.busy:
+            self._pending_open = text
+            return
+        self.addr_var.set(text)
+        self.on_open_or_clone()
 
     # ------------------------------------------------------------------ 地址栏动作
     def on_open_or_clone(self) -> None:
@@ -576,6 +635,11 @@ class App(tk.Tk):
         text = self.addr_var.get().strip().strip('"')
         if not text:
             messagebox.showinfo(APP_NAME, "请输入本地仓库路径或 GitHub 仓库地址")
+            return
+        if self.busy:
+            # 有后台任务在跑：先记住地址，任务结束后自动打开，避免"改了没反应"
+            self._pending_open = text
+            self._print(f"当前有任务在运行，任务结束后将自动打开：{text}", "info")
             return
         if is_git_url(text):
             self.on_clone(text)
@@ -711,6 +775,103 @@ class App(tk.Tk):
         ttk.Button(btns, text="保存", command=save).pack(side="left", padx=4)
         ttk.Button(btns, text="取消", command=dialog.destroy).pack(side="left", padx=4)
 
+    def on_remote_settings(self) -> None:
+        """远程仓库设置对话框：查看 / 添加 / 修改 / 删除远程（git remote 系列命令）。"""
+        if not self._require_repo():
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("远程仓库设置")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("600x360")
+
+        ttk.Label(dialog, text="已关联的远程仓库：").pack(anchor="w", padx=12, pady=(12, 2))
+        remote_tree = ttk.Treeview(dialog, columns=("name", "url"), show="headings", height=5)
+        remote_tree.heading("name", text="名称")
+        remote_tree.heading("url", text="地址")
+        remote_tree.column("name", width=90, anchor="center")
+        remote_tree.column("url", width=460)
+        remote_tree.pack(fill="x", padx=12)
+
+        def refresh_list() -> None:
+            remote_tree.delete(*remote_tree.get_children())
+            for name, url in self.git.remotes():
+                remote_tree.insert("", "end", values=(name, url))
+
+        refresh_list()
+
+        ttk.Label(dialog, text="添加或修改（选中列表中的远程可自动填入名称）：").pack(anchor="w", padx=12, pady=(10, 2))
+        form = ttk.Frame(dialog)
+        form.pack(fill="x", padx=12)
+        ttk.Label(form, text="名称：").pack(side="left")
+        name_var = tk.StringVar(value="origin")
+        ttk.Entry(form, textvariable=name_var, width=12).pack(side="left", padx=(0, 10))
+        ttk.Label(form, text="地址：").pack(side="left")
+        url_var = tk.StringVar()
+        ttk.Entry(form, textvariable=url_var, width=42).pack(side="left")
+
+        def fill_from_selection(_event=None) -> None:
+            sel = remote_tree.selection()
+            if sel:
+                name, url = remote_tree.item(sel[0], "values")
+                name_var.set(name)
+                url_var.set(url)
+
+        remote_tree.bind("<<TreeviewSelect>>", fill_from_selection)
+
+        def run_remote_cmd(*args: str) -> bool:
+            """执行 git remote 子命令，成功返回 True。"""
+            code, _, err = self.git.run("remote", *args)
+            if code != 0:
+                messagebox.showerror(APP_NAME, f"操作失败：{err}")
+                return False
+            return True
+
+        def add_remote() -> None:
+            name = name_var.get().strip()
+            url = url_var.get().strip()
+            if not name or not url:
+                messagebox.showinfo(APP_NAME, "请填写远程名称和地址")
+                return
+            if run_remote_cmd("add", name, url):
+                self._print(f"$ git remote add {name} {url}", "cmd")
+                self._print(f"已关联远程仓库 {name} → {url}", "ok")
+                refresh_list()
+                self._refresh_light()
+
+        def set_url() -> None:
+            name = name_var.get().strip()
+            url = url_var.get().strip()
+            if not name or not url:
+                messagebox.showinfo(APP_NAME, "请填写远程名称和地址")
+                return
+            if run_remote_cmd("set-url", name, url):
+                self._print(f"$ git remote set-url {name} {url}", "cmd")
+                self._print(f"已修改远程 {name} 的地址 → {url}", "ok")
+                refresh_list()
+                self._refresh_light()
+
+        def remove_remote() -> None:
+            sel = remote_tree.selection()
+            if not sel:
+                messagebox.showinfo(APP_NAME, "请先在列表中选中要删除的远程")
+                return
+            name = remote_tree.item(sel[0], "values")[0]
+            if not messagebox.askyesno(APP_NAME, f"确定解除远程仓库 {name} 的关联？"):
+                return
+            if run_remote_cmd("remove", name):
+                self._print(f"$ git remote remove {name}", "cmd")
+                self._print(f"已解除远程 {name} 的关联", "ok")
+                refresh_list()
+                self._refresh_light()
+
+        btns = ttk.Frame(dialog)
+        btns.pack(fill="x", padx=12, pady=12)
+        ttk.Button(btns, text="添加远程", command=add_remote).pack(side="left", padx=4)
+        ttk.Button(btns, text="修改地址", command=set_url).pack(side="left", padx=4)
+        ttk.Button(btns, text="删除远程", command=remove_remote).pack(side="left", padx=4)
+        ttk.Button(btns, text="关闭", command=dialog.destroy).pack(side="left", padx=4)
+
     # ------------------------------------------------------------------ 操作按钮
     def on_refresh(self) -> None:
         """刷新文件树、变更、历史、分支。"""
@@ -744,19 +905,71 @@ class App(tk.Tk):
                           f"git add {' '.join(files)}", "添加所选")
 
     def on_discard_selected(self) -> None:
-        """放弃所选文件的未提交修改（checkout -- 文件）。"""
+        """放弃所选文件的未提交修改（checkout -- 文件）。
+
+        未追踪文件（??）还没有被 git 记录，无法"恢复"——单独提示处理方式。
+        """
         if not self._require_repo():
             return
         sel = self.status_tree.selection()
         if not sel:
             messagebox.showinfo(APP_NAME, "请在「变更」页签中先选择文件")
             return
-        files = [self.status_tree.item(i, "values")[1] for i in sel]
-        if not messagebox.askyesno(APP_NAME,
-                                   "确定放弃所选文件的修改？\n（未暂存改动将丢失）\n\n" + "\n".join(files)):
-            return
-        self._run_console(lambda g: g.run("checkout", "--", *files),
-                          f"git checkout -- {' '.join(files)}", "放弃修改")
+        # 区分已跟踪文件与未追踪文件（查状态码，未追踪是 ??）
+        xy_map = {p: xy for xy, p in self.git.status()}
+        tracked, untracked = [], []
+        for i in sel:
+            path = self.status_tree.item(i, "values")[1]
+            (untracked if xy_map.get(path) == "??" else tracked).append(path)
+        # 已跟踪文件：可恢复原样，按原逻辑放弃修改
+        if tracked:
+            if messagebox.askyesno(APP_NAME,
+                                   "确定放弃所选文件的修改？\n（未暂存改动将丢失）\n\n" + "\n".join(tracked)):
+                self._run_console(lambda g: g.run("checkout", "--", *tracked),
+                                  f"git checkout -- {' '.join(tracked)}", "放弃修改")
+        # 未追踪文件：git 里根本没有它们的历史版本，不能"恢复"
+        if untracked:
+            detail = "\n".join(untracked)
+            choice = messagebox.askyesnocancel(
+                APP_NAME,
+                f"以下文件是「未追踪」的：git 还没记录过它们，所以没有旧版本可恢复。\n\n"
+                f"{detail}\n\n"
+                f"可选择：\n"
+                f"· 是 —— 直接删除这些文件（不可恢复！）\n"
+                f"· 否 —— 保留文件，但把它们加入 .gitignore 不再提示\n"
+                f"· 取消 —— 什么都不做")
+            if choice is True:      # 删除文件
+                if messagebox.askyesno(APP_NAME, f"⚠ 确定永久删除以下文件？\n\n{detail}"):
+                    deleted = []
+                    for path in untracked:
+                        try:
+                            (self.repo_dir / path).unlink()
+                            deleted.append(path)
+                        except OSError as exc:
+                            messagebox.showerror(APP_NAME, f"删除 {path} 失败：{exc}")
+                    self._print(f"已删除：{'、'.join(deleted)}", "ok")
+                    self._refresh_light()
+            elif choice is False:   # 加入 .gitignore
+                self._ignore_files(untracked)
+
+    def _ignore_files(self, files: list[str]) -> None:
+        """把给定文件加入仓库的 .gitignore（追加到已有文件末尾）。"""
+        gitignore = self.repo_dir / ".gitignore"
+        try:
+            existing = gitignore.read_text(encoding="utf-8").splitlines() if gitignore.exists() else []
+            lines = [ln for ln in existing if ln.strip()]
+            names = [ln for ln in lines if ln.strip().startswith("#") is False]
+            added = []
+            for path in files:
+                entry = path.replace("\\", "/")
+                if entry not in names:
+                    lines.append(entry)
+                    added.append(entry)
+            gitignore.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            self._print(f"已加入 .gitignore：{'、'.join(added) if added else '（都已存在）'}", "ok")
+            self._refresh_light()
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"写入 .gitignore 失败：{exc}")
 
     def on_commit(self) -> None:
         """打开提交对话框。"""
@@ -777,15 +990,20 @@ class App(tk.Tk):
         self._run_console(lambda g: g.push(), "git push", "推送")
 
     def on_pull(self) -> None:
-        """从远程拉取。"""
+        """从远程拉取（默认用 merge 方式合并）。
+
+        新版 git 遇到分叉历史时要求先配置 pull.rebase，否则会中止拉取。
+        --no-rebase 让拉取始终走 merge（对新手最直观，且自动处理冲突提示）。
+        """
         if not self._require_repo():
             return
         def do_pull(g: Git):
             remotes = g.remotes()
             if not remotes:
                 return False, "", "没有配置远程仓库，无法拉取"
-            return g.run("pull", g.auth_url(remotes[0][1]))
-        self._run_console(do_pull, "git pull", "拉取")
+            return g.run("pull", "--no-rebase",
+                         g.auth_url(remotes[0][1]))
+        self._run_console(do_pull, "git pull --no-rebase", "拉取")
 
     def on_stash(self) -> None:
         """暂存当前所有改动（含未跟踪文件）。"""
@@ -945,8 +1163,10 @@ class App(tk.Tk):
                      diff_only: bool = False, file: str = "") -> None:
         """在后台跑一个 git 命令，把结果打到控制台/差异页，然后轻量刷新。"""
         if self.busy:
+            self._print("当前有任务在运行，请稍候再操作……", "info")
             return
         self._set_busy(True)
+        self._set_status(f"{status_text}中…（按钮暂不可用）")
         self._print(f"$ {cmd_text}", "cmd")
         Worker(self._queue, self._work_console, fn, status_text,
                diff_only, file).start()
@@ -993,19 +1213,122 @@ class App(tk.Tk):
         self._set_status("刷新中…")
         Worker(self._queue, self._work_refresh).start()
 
+    # ------------------------------------------------------------------ 变更信息报告
+    def _git_dir(self) -> Path | None:
+        """定位本仓库 .git 的实际目录（兼容子模块/多个 worktree 的情形）。"""
+        if self.git is None or self.repo_dir is None:
+            return None
+        code, out, _ = self.git.run("rev-parse", "--git-dir")
+        if code != 0 or not out.strip():
+            return None
+        p = Path(out.strip())
+        return p if p.is_absolute() else (self.repo_dir / p)
+
+    def _ignore_report_file(self) -> None:
+        """把报告文件名加入该仓库 .git/info/exclude，避免报告文件自己变成变更。
+
+        选 .git/info/exclude（本地忽略、不随仓库提交）而不是 .gitignore，
+        这样报告文件能一直放在仓库文件夹里备查，又不污染版本管理。
+        """
+        if not REPORT_FILENAME:
+            return
+        git_dir = self._git_dir()
+        if git_dir is None:
+            return
+        exclude = git_dir / "info" / "exclude"
+        try:
+            existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        except OSError:
+            return
+        if any(line.strip() == REPORT_FILENAME for line in existing.splitlines()):
+            return
+        try:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            with exclude.open("a", encoding="utf-8", newline="\n") as fh:
+                if existing and not existing.endswith("\n"):
+                    fh.write("\n")
+                fh.write("\n# Git 管理器自动生成：忽略仓库变更信息报告文件\n")
+                fh.write(REPORT_FILENAME + "\n")
+        except OSError:
+            return
+
+    def _write_change_report(self, statuses: list, commits: list,
+                             branches: list, branch: str) -> bool:
+        """把本次刷新抓到的仓库变更信息写入仓库根目录的「仓库变更信息.txt」。
+
+        每次打开/刷新都会覆盖更新；返回 True 表示本次是新生成该文件
+        （用于界面只在首次生成时提示一次）。写文件失败不影响主流程。
+        """
+        if self.repo_dir is None:
+            return False
+        self._ignore_report_file()   # 先登记忽略，保证报告文件自己不会被计入变更
+        path = self.repo_dir / REPORT_FILENAME
+        was_absent = not path.exists()
+        remotes = self.git.remotes() if self.git else []
+        lines = [
+            "=" * 56,
+            "  仓库变更信息报告（由 Git 管理器自动生成）",
+            "=" * 56,
+            f"仓库路径：{self.repo_dir}",
+            f"生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"当前分支：{branch}",
+            "远程仓库：" + ("；".join(f"{n} → {u}" for n, u in remotes)
+                            if remotes else "（无）"),
+            "",
+            f"【变更列表】共 {len(statuses)} 项",
+        ]
+        if not statuses:
+            lines.append("  （工作区干净，没有变更）")
+        else:
+            for xy, rel in statuses:
+                label = STATUS_STYLE.get(xy, (xy, ""))[0]
+                lines.append(f"  · {label}　{rel}")
+        lines += ["", f"【最近提交】（显示前 {REPORT_COMMIT_LIMIT} 条，最新在上）"]
+        if not commits:
+            lines.append("  （仓库还没有提交）")
+        else:
+            for h, date, author, msg in commits[:REPORT_COMMIT_LIMIT]:
+                lines.append(f"  · {h}  {date}  {author}  {msg}")
+        lines += ["", f"【本地分支】共 {len(branches)} 个"]
+        if not branches:
+            lines.append("  （无）")
+        else:
+            for name, is_cur, subject in branches:
+                mark = "●" if is_cur else "○"
+                lines.append(f"  {mark} {name}"
+                             + (f"　—— {subject}" if subject else ""))
+        lines += [
+            "",
+            "-" * 56,
+            "说明：本文件由「Git 管理器」在每次打开/刷新仓库时自动更新，",
+            "放在本仓库文件夹内备查；已被加入 .git/info/exclude，不会算作仓库变更，",
+            "可随时手动删除。",
+        ]
+        try:
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            return False
+        return was_absent
+
     def _work_refresh(self) -> dict:
-        """后台线程：收集文件树/变更/历史/分支数据。"""
+        """后台线程：收集文件树/变更/历史/分支，并写入仓库文件夹内的变更信息报告。"""
+        self._ignore_report_file()          # 先忽略报告文件自身（幂等，每次刷新都保证）
         statuses = self.git.status()
         changed = {path: xy for xy, path in statuses}
         tree_items = self._build_tree_items()
+        commits = self.git.commits()
+        branches = self.git.branches()
+        branch = self.git.current_branch()
+        report_created = self._write_change_report(statuses, commits, branches, branch)
         return {
             "action": "refresh",
             "statuses": statuses,
             "changed": changed,
             "tree": tree_items,
-            "commits": self.git.commits(),
-            "branches": self.git.branches(),
-            "branch": self.git.current_branch(),
+            "commits": commits,
+            "branches": branches,
+            "branch": branch,
+            "report_created": report_created,
         }
 
     def _build_tree_items(self) -> list[tuple[str, str, str, str]]:
@@ -1071,6 +1394,10 @@ class App(tk.Tk):
             remote = f"　远程：{remotes[0][1]}" if remotes else "　远程：(无)"
         n = len(payload["statuses"])
         self._set_status(f"已刷新：{n} 个变更{remote}")
+        # 变更信息报告文件首次生成到仓库文件夹时，提示一次所在位置
+        if payload.get("report_created") and self.repo_dir is not None:
+            self._print(f"已将仓库变更信息写入仓库文件夹：{self.repo_dir / REPORT_FILENAME}",
+                        "info")
 
     def _refresh_light(self) -> None:
         """操作后轻量刷新（内容与全量刷新一致，对常见仓库足够快）。"""
@@ -1113,7 +1440,13 @@ class CommitDialog(tk.Toplevel):
         self.title("提交更改")
         self.transient(app)
         self.grab_set()
-        self.geometry("560x340")
+        self.geometry("560x360")
+        # 置顶并相对主窗口居中，避免对话框跑到屏幕外/主窗口后面而"看不到"
+        self.lift()
+        self.update_idletasks()
+        px, py = app.winfo_rootx(), app.winfo_rooty()
+        pw, ph = app.winfo_width(), app.winfo_height()
+        self.geometry(f"+{px + (pw - 560) // 2}+{py + (ph - 360) // 3}")
 
         ttk.Label(self, text="提交信息：").pack(anchor="w", padx=14, pady=(14, 2))
         self.msg_text = tk.Text(self, height=6, font=("Segoe UI", 10))
@@ -1125,12 +1458,17 @@ class CommitDialog(tk.Toplevel):
         self.author_var = tk.StringVar()
         ttk.Entry(self, textvariable=self.author_var).pack(fill="x", padx=14)
 
-        self.push_var = tk.BooleanVar(value=True)
+        # 默认是否"提交并推送"：已配置 Token 才默认勾选，否则只做本地提交，
+        # 避免新手点提交时偷偷推送、因网络/认证问题卡住造成"没反应"
+        self.push_var = tk.BooleanVar(value=bool(self.app.cfg.get("github_token")))
         ttk.Checkbutton(self, text="提交并推送到远程（需要配置 Token 或已登录凭据）",
                         variable=self.push_var).pack(anchor="w", padx=14, pady=(4, 0))
         self.auto_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(self, text="提交前自动暂存全部改动（git add -A）",
                         variable=self.auto_var).pack(anchor="w", padx=14, pady=(2, 4))
+        ttk.Label(self, foreground="#6b7280",
+                  text="提示：本地提交请保持上面不勾选；需要同步到 GitHub 时再勾选并配置 Token。",
+                  wraplength=520, justify="left").pack(anchor="w", padx=14, pady=(0, 4))
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=14, pady=12)
@@ -1152,6 +1490,7 @@ class CommitDialog(tk.Toplevel):
         self.destroy()
         app = self.app
         app._set_busy(True)
+        app._set_status("提交中…（按钮暂不可用）")
         app._print("$ git add -A && git commit" + (" && git push" if push else ""), "cmd")
 
         def work(g: Git):
@@ -1267,6 +1606,22 @@ def run_selftest() -> int:
         ok, msg = g2.push()
         record("push 无提交提示", not ok and "还没有任何提交" in msg, msg)
         shutil.rmtree(tmp2, ignore_errors=True)
+        # 18. 变更信息报告：生成在仓库自己的文件夹里，且不会把自己算作变更
+        stub = object.__new__(App)   # 借用 App 的方法做无界面验证，不创建 Tk 窗口
+        stub.repo_dir = tmp
+        stub.git = Git(repo_dir=tmp)
+        created = stub._write_change_report([("M", "hello.txt")],
+                                            stub.git.commits(),
+                                            stub.git.branches(),
+                                            stub.git.current_branch())
+        report = tmp / REPORT_FILENAME
+        record("变更报告生成在仓库文件夹",
+               created and report.is_file(),
+               f"created={created}, exists={report.exists()}")
+        status_now = stub.git.status()
+        record("变更报告不污染变更列表",
+               not any(p == REPORT_FILENAME for _, p in status_now),
+               f"status={status_now}")
     except Exception as exc:  # noqa: BLE001
         record("异常", False, str(exc))
     finally:
