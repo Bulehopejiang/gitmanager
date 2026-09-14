@@ -45,8 +45,7 @@ def _config_path() -> Path:
 CONFIG_FILE = _config_path()   # 保存 GitHub Token 等配置
 
 # 变更状态 -> (显示文字, 颜色) 的映射，用于文件树和变更列表
-STATUS_STYLE = {
-    "M":  ("已修改", "#d97706"),   # 已修改（工作区）
+STATUS_STYLE = {    "M":  ("已修改", "#d97706"),   # 已修改（工作区）
     "A":  ("已添加", "#16a34a"),   # 已暂存新增
     "D":  ("已删除", "#dc2626"),   # 已删除
     "R":  ("已重命名", "#9333ea"),
@@ -58,6 +57,25 @@ STATUS_STYLE = {
 # 打开/刷新仓库后，把抓取到的变更信息写入各仓库自己的文件夹（报告文件）
 REPORT_FILENAME = "仓库变更信息.txt"   # 报告文件名，生成在仓库根目录
 REPORT_COMMIT_LIMIT = 10               # 报告里最多展示的提交条数
+
+# 常见二进制文件扩展名：无法逐行对比/预览，只能提示"内容有变化"
+# （未跟踪文件预览时用；已跟踪文件的二进制判定由 git 自己给出）
+BINARY_EXTENSIONS = (
+    # Office / 文档
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf",
+    ".vsd", ".vsdx", ".odt", ".ods", ".odp", ".rtf",
+    # 图片 / 音视频
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tif", ".tiff",
+    ".webp", ".psd", ".svgz", ".mp3", ".wav", ".flac", ".mp4", ".avi",
+    ".mov", ".mkv", ".wmv",
+    # 压缩 / 可执行 / 库 / 中间产物
+    ".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".tar",
+    ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".lib", ".bin", ".pyc",
+    ".class", ".jar", ".msi", ".iso",
+    # 数据库 / 字体 / FPGA 编程文件
+    ".db", ".sqlite", ".sqlite3", ".mdb", ".ttf", ".otf", ".woff", ".woff2",
+    ".sof", ".pof", ".jic", ".rbf", ".qdb",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +110,25 @@ def _is_network_error(text: str) -> bool:
                 "Could not resolve host", "Connection timed out",
                 "连接超时", "无法连接")
     return any(k in text for k in keywords)
+
+
+def status_label(xy: str) -> str:
+    """把 git 的状态码转成中文标签（兼容 MM / AM 这类组合码）。
+
+    git 的状态码是两位：第一位=暂存区、第二位=工作区。
+    例如 "MM" 表示"已暂存一部分、又改了一部分"，直接显示 MM 会让人看不懂。
+    """
+    if xy in STATUS_STYLE:
+        return STATUS_STYLE[xy][0]
+    if len(xy) == 2 and xy[0] == xy[1]:          # MM / UU / AA
+        return STATUS_STYLE.get(xy[0], (xy, ""))[0]
+    if len(xy) == 2 and " " not in xy:           # 两位都有内容且不同，如 AM
+        base = STATUS_STYLE.get(xy[1], (xy[1], ""))[0]
+        return f"{base}（还有已暂存的部分）"
+    if len(xy) == 2:                             # 只有一位有意义
+        ch = xy[0] if xy[0] != " " else xy[1]
+        return STATUS_STYLE.get(ch, (ch, ""))[0]
+    return xy
 
 
 def load_config() -> dict:
@@ -344,6 +381,15 @@ class App(tk.Tk):
         self._build_style()
         self._build_ui()
         self._poll_queue()
+        # 启动信息：打印正在运行的程序文件与最后修改时间，
+        # 便于确认是否在跑最新代码（改过代码必须重启才生效）
+        try:
+            me = Path(__file__).resolve()
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S",
+                                  time.localtime(me.stat().st_mtime))
+            self._print(f"程序文件：{me}（最后修改 {stamp}）", "info")
+        except OSError:
+            pass
         self._print("提示：请在地址栏输入本地仓库路径，或粘贴 GitHub 仓库地址（将自动克隆）。")
 
         # 启动时自动打开上次的仓库（先校验它仍是有效仓库，避免弹出无谓的对话框）
@@ -430,6 +476,8 @@ class App(tk.Tk):
                   font=("Segoe UI", 9)).pack(anchor="w", padx=4, pady=(2, 0))
         self.tree = ttk.Treeview(left, show="tree", selectmode="browse")
         self.tree.pack(fill="both", expand=True)
+        # 双击文件树里的文件 = 查看差异（双击目录仍是展开/收起）
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
         self.tree.tag_configure("dir", foreground="#374151")
         self.tree.tag_configure("M", foreground="#d97706")
         self.tree.tag_configure("A", foreground="#16a34a")
@@ -453,6 +501,8 @@ class App(tk.Tk):
         self.status_tree.column("st", width=90, anchor="center")
         self.status_tree.column("file", width=380)
         self.status_tree.pack(fill="both", expand=True, padx=4, pady=4)
+        # 双击文件 = 直接查看差异（比"选中再点按钮"更顺手）
+        self.status_tree.bind("<Double-1>", lambda _e: self.on_diff())
         for tag, (_, color) in STATUS_STYLE.items():
             self.status_tree.tag_configure(tag, foreground=color)
         row = ttk.Frame(tab_status)
@@ -892,15 +942,44 @@ class App(tk.Tk):
             return
         self._run_console(lambda g: g.run("add", "-A"), "git add -A", "添加全部")
 
+    def _show_no_selection_hint(self) -> None:
+        """「变更」页签没选中文件时的提示。
+
+        区分两种情况：列表是空的（没有可操作对象，说明仓库干净或改动被忽略）
+        vs 有文件但没选中 —— 后者只是操作不完整，前者要看清楚原因。
+        """
+        has_rows = bool(self.status_tree.get_children())
+        if has_rows:
+            messagebox.showinfo(APP_NAME, "请在「变更」页签中先点击选中一个文件，再点此按钮。")
+        else:
+            repo = self.repo_dir or "（未打开仓库）"
+            messagebox.showinfo(
+                APP_NAME,
+                "「变更」页签里没有任何文件，所以没有可查看/操作的对象。\n\n"
+                f"当前仓库：{repo}\n\n"
+                "可能的原因：\n"
+                "· 所有改动都已提交（工作区是干净的）\n"
+                "· 改动被 .gitignore 忽略了\n"
+                "· 你刚在编辑器里改过文件，但界面还是旧快照 —— 请先点「🔄 刷新」\n\n"
+                "可点「状态」按钮，在下方控制台查看 git 的完整判断结果。")
+
     def on_add_selected(self) -> None:
-        """添加「变更」页签中选中的文件。"""
+        """添加选中的文件。
+
+        「变更」页签支持多选（可一次添加多个）；若那里没选，则回退用
+        左侧文件树里选中的单个文件。
+        """
         if not self._require_repo():
             return
         sel = self.status_tree.selection()
-        if not sel:
-            messagebox.showinfo(APP_NAME, "请在「变更」页签中先选择文件")
-            return
-        files = [self.status_tree.item(i, "values")[1] for i in sel]
+        if sel:
+            files = [self.status_tree.item(i, "values")[1] for i in sel]
+        else:
+            one = self._selected_file()
+            if one is None:
+                self._show_no_selection_hint()
+                return
+            files = [one]
         self._run_console(lambda g: g.run("add", "--", *files),
                           f"git add {' '.join(files)}", "添加所选")
 
@@ -912,14 +991,18 @@ class App(tk.Tk):
         if not self._require_repo():
             return
         sel = self.status_tree.selection()
-        if not sel:
-            messagebox.showinfo(APP_NAME, "请在「变更」页签中先选择文件")
-            return
+        if sel:
+            files = [self.status_tree.item(i, "values")[1] for i in sel]
+        else:
+            one = self._selected_file()   # 回退：左侧文件树里选中的文件
+            if one is None:
+                self._show_no_selection_hint()
+                return
+            files = [one]
         # 区分已跟踪文件与未追踪文件（查状态码，未追踪是 ??）
         xy_map = {p: xy for xy, p in self.git.status()}
         tracked, untracked = [], []
-        for i in sel:
-            path = self.status_tree.item(i, "values")[1]
+        for path in files:
             (untracked if xy_map.get(path) == "??" else tracked).append(path)
         # 已跟踪文件：可恢复原样，按原逻辑放弃修改
         if tracked:
@@ -1019,39 +1102,94 @@ class App(tk.Tk):
             return
         self._run_console(lambda g: g.run("stash", "pop"), "git stash pop", "恢复暂存")
 
+    def _selected_file(self) -> str | None:
+        """取当前选中的文件路径（相对仓库根）。
+
+        优先用「变更」页签的选中项；若没选，则用左侧文件树里选中的文件
+        （树里也标了变更颜色，用户很容易在那边点选）。
+        返回 None 表示没有可用的选中文件（没选、或选中的是目录）。
+        """
+        sel = self.status_tree.selection()
+        if sel:
+            return self.status_tree.item(sel[0], "values")[1]
+        tree_sel = self.tree.selection()
+        if tree_sel:
+            iid = tree_sel[0]
+            # 文件树的 iid 就是相对路径；目录（含子节点）不参与文件级操作
+            if not self.tree.get_children(iid):
+                return iid
+        return None
+
+    def _on_tree_double_click(self, _event=None) -> None:
+        """双击左侧文件树里的文件 = 查看差异（双击目录仍是展开/收起）。"""
+        sel = self.tree.selection()
+        if sel and not self.tree.get_children(sel[0]):
+            self.on_diff()
+
     def on_diff(self) -> None:
-        """查看选中文件的差异（自动区分已暂存 / 未暂存 / 未跟踪）。"""
+        """查看选中文件的差异（自动区分已暂存 / 未暂存 / 未跟踪）。
+
+        支持两种选中方式：「变更」页签列表，或左侧文件树。
+        """
         if not self._require_repo():
             return
-        sel = self.status_tree.selection()
-        if not sel:
-            messagebox.showinfo(APP_NAME, "请在「变更」页签中先选择文件")
+        path = self._selected_file()
+        if path is None:
+            self._show_no_selection_hint()
             return
-        path = self.status_tree.item(sel[0], "values")[1]
         # 查该文件的状态码：?? 未跟踪；首位非空格 = 已暂存；否则 = 仅未暂存
         xy = "  "
         for code, p in self.git.status():
             if p == path:
                 xy = code
                 break
+        if xy == "  ":
+            # 选中的文件没有任何未提交改动，没有差异可看
+            messagebox.showinfo(
+                APP_NAME,
+                f"文件没有未提交的改动，因此没有差异可看：\n\n{path}\n\n"
+                "（只有改过的文件才有差异；若你刚在编辑器里改过它，请先点「🔄 刷新」）")
+            return
         if xy == "??":
             # 未跟踪新文件：git diff 对它没有输出，改为预览文件内容
             self._print(f"$ 新文件（未跟踪）：{path}", "cmd")
 
             def preview(_g):
                 try:
-                    content = (self.repo_dir / path).read_text(
-                        encoding="utf-8", errors="replace")
-                    return (0, f"（新文件，尚未纳入版本管理，点「添加全部」后即可提交）\n\n{content}", "")
+                    raw = (self.repo_dir / path).read_bytes()
                 except OSError as exc:
                     return (1, "", f"读取失败：{exc}")
+                # 二进制判定：文件头含 NUL 字节，或扩展名属于常见二进制格式
+                is_binary = (b"\x00" in raw[:8000]
+                             or path.lower().endswith(BINARY_EXTENSIONS))
+                if is_binary:
+                    return (0, "这是二进制文件（如 Word / 图片 / 压缩包），"
+                               "无法逐行预览内容，只能确认它有内容。\n\n"
+                               f"（新文件：{path}，点「添加全部」后即可提交）", "")
+                # 文本文件：先按 UTF-8 解码，失败再按 GBK（中文项目常见），
+                # 保证中文源码/文档预览不乱码
+                content = None
+                for enc in ("utf-8", "gbk"):
+                    try:
+                        content = raw.decode(enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if content is None:
+                    content = raw.decode("utf-8", errors="replace")
+                return (0, f"（新文件，尚未纳入版本管理，点「添加全部」后即可提交）\n\n{content}", "")
 
             self._run_console(preview, f"新文件预览：{path}", "差异",
                               diff_only=True, file=path)
         else:
-            # 已跟踪文件：diff HEAD 同时覆盖已暂存与未暂存的改动，预览最全
-            self._run_console(lambda g: g.run("diff", "HEAD", "--", path),
-                              f"git diff HEAD -- {path}", "差异", diff_only=True, file=path)
+            # 已跟踪文件：diff HEAD 同时覆盖已暂存与未暂存的改动，预览最全。
+            # --no-textconv：禁用 .docx 等 Office 文档的文本转换助手
+            # （便携版 git 缺少 astextplain 脚本时，不加它会报
+            #  "cannot spawn astextplain" 导致无法查看差异）。
+            self._run_console(
+                lambda g: g.run("diff", "--no-textconv", "HEAD", "--", path),
+                f"git diff --no-textconv HEAD -- {path}", "差异",
+                diff_only=True, file=path)
 
     def on_rollback(self) -> None:
         """版本回溯：把仓库恢复到历史中的某个版本。"""
@@ -1281,8 +1419,7 @@ class App(tk.Tk):
             lines.append("  （工作区干净，没有变更）")
         else:
             for xy, rel in statuses:
-                label = STATUS_STYLE.get(xy, (xy, ""))[0]
-                lines.append(f"  · {label}　{rel}")
+                lines.append(f"  · {status_label(xy)}　{rel}")
         lines += ["", f"【最近提交】（显示前 {REPORT_COMMIT_LIMIT} 条，最新在上）"]
         if not commits:
             lines.append("  （仓库还没有提交）")
@@ -1376,8 +1513,8 @@ class App(tk.Tk):
         # 变更列表
         self.status_tree.delete(*self.status_tree.get_children())
         for xy, path in payload["statuses"]:
-            label, _ = STATUS_STYLE.get(xy, (xy, "#6b7280"))
-            self.status_tree.insert("", "end", values=(label, path), tags=(xy,))
+            self.status_tree.insert("", "end", values=(status_label(xy), path),
+                                    tags=(xy,))
         # 提交历史
         self.log_tree.delete(*self.log_tree.get_children())
         for h, date, author, msg in payload["commits"]:
@@ -1393,7 +1530,8 @@ class App(tk.Tk):
             remotes = self.git.remotes()
             remote = f"　远程：{remotes[0][1]}" if remotes else "　远程：(无)"
         n = len(payload["statuses"])
-        self._set_status(f"已刷新：{n} 个变更{remote}")
+        repo_name = self.repo_dir.name if self.repo_dir else "-"
+        self._set_status(f"仓库：{repo_name}　|　已刷新：{n} 个变更{remote}")
         # 变更信息报告文件首次生成到仓库文件夹时，提示一次所在位置
         if payload.get("report_created") and self.repo_dir is not None:
             self._print(f"已将仓库变更信息写入仓库文件夹：{self.repo_dir / REPORT_FILENAME}",
@@ -1411,10 +1549,23 @@ class App(tk.Tk):
         self.diff_text.configure(state="normal")
         self.diff_text.delete("1.0", "end")
         if payload["code"] != 0:
-            self.diff_text.insert("end", payload["err"] or "无差异", "hdr")
+            self.diff_text.insert("end", payload["err"] or "无差异", ("hdr",))
         else:
             content = payload["out"] or "（无差异）"
-            for line in content.splitlines():
+            # 二进制文件（Word/图片等）git 只能告诉你"变了"，无法逐行对比。
+            # 注意：必须精确匹配 git 的固定输出行，不能只搜关键词 ——
+            # 否则文本文件里恰好写了这些字（比如源码注释）会被误判。
+            lines = content.splitlines()
+            is_binary = any(line.startswith("Binary files ")
+                            or line.startswith("GIT binary patch")
+                            for line in lines)
+            if is_binary:
+                self.diff_text.insert(
+                    "end",
+                    "这是二进制文件（如 Word / 图片 / 压缩包），只能确认它被修改过，\n"
+                    "无法显示具体内容差异（文本文件才能逐行对比）。\n\n",
+                    ("hdr",))
+            for line in lines:
                 if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
                     tag = "hdr"
                 elif line.startswith("+"):
@@ -1422,8 +1573,12 @@ class App(tk.Tk):
                 elif line.startswith("-"):
                     tag = "del"
                 else:
-                    tag = ""
-                self.diff_text.insert("end", line + "\n", (tag,))
+                    tag = None
+                # 普通行不带标签，避免传入空标签名
+                if tag:
+                    self.diff_text.insert("end", line + "\n", (tag,))
+                else:
+                    self.diff_text.insert("end", line + "\n")
         self.diff_text.configure(state="disabled")
         self._set_status(f"差异：{payload['file']}")
 

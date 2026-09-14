@@ -147,10 +147,25 @@ python git_manager.py https://github.com/用户/仓库      # 启动并克隆 Gi
 
 ```bash
 python git_manager.py --selftest   # 19 项自动化自测，全部 PASS 时退出码为 0
+python 文件类型覆盖测试.py          # 34 项文件类型覆盖测试
 ```
 
-自动化自测 + 手工功能验收清单 + 异常场景测试 + 本地裸仓库模拟远程的方法，
-详见 **`测试指南.md`**。
+- **`--selftest`**：核心 git 操作（init / add / commit / log / 分支 / stash / 三种回溯 / 推送前置检查等）
+- **`文件类型覆盖测试.py`**：自动造一个含 34 种文件的仓库，逐个验证「查看差异」——
+  21 种文本格式（.py/.c/.h/.v/.sv/.txt/.md/.json/.xml/.yaml/.ini/.cfg/.csv/.tcl/.asm/.mif/.qsf/.sh/.bat/.log）、
+  二进制格式（.png/.pdf/.docx）、特殊文件名（中文、空格、`#&%+()[]`）、深层目录、
+  大写扩展名、无扩展名、多点文件名、GBK 编码文件、空文件
+
+手工功能验收清单 + 异常场景测试 + 本地裸仓库模拟远程的方法，详见 **`测试指南.md`**。
+
+## 支持的文件类型
+
+| 类型 | 差异显示 |
+| --- | --- |
+| **文本文件**（.py .c .h .v .sv .txt .md .json .xml .yaml .ini .cfg .csv .tcl .asm .mif .qsf .sh .bat .log …） | 逐行对比：绿=新增、红=删除、蓝=位置标记 |
+| **二进制文件**（.docx .xlsx .pdf .png .jpg .zip .exe .vsdx .pyc …） | 提示"内容有变化"，无法逐行对比（git 固有特性） |
+| **文件名** | 支持中文、空格、`#&%+()[]` 等特殊字符、深层目录、无扩展名 |
+| **编码** | UTF-8 与 GBK 均可正确显示（中文源码/文档不乱码） |
 
 ## 文件说明
 
@@ -159,6 +174,7 @@ git_manager.py      主程序（单文件：界面 + git 封装 + 自测）
 启动Git管理器.bat   Windows 双击启动脚本
 README.md           本文档
 测试指南.md          自动化自测 + 手工验收 + 异常场景测试清单
+文件类型覆盖测试.py   34 种文件类型的「查看差异」覆盖测试
 demo_repo/          演示仓库：4 提交（跨 2 分支）/ 含未提交改动，已关联 test_remote.git
 test_remote.git     本地测试远程（裸仓库，用于无网络测试推送/拉取，可删）
 我的项目/           极简示例仓库（1 个提交，可删）
