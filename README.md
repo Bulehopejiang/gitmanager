@@ -37,7 +37,7 @@
 ## 环境要求
 
 - Windows / macOS / Linux 均可
-- Python 3.8+（自带 tkinter）
+- Python 3.8+（自带 tkinter，若直接使用.exe文件则可忽视此条目）
 - Git 已安装并加入 PATH（https://git-scm.com）
 
 ## 启动方式
