@@ -1344,13 +1344,19 @@ class App(tk.Tk):
                 "tag": "ok" if code == 0 else "err",
                 "status": f"{status_text}完成" if code == 0 else f"{status_text}失败"}
 
-    def _on_focus_refresh(self, _event=None) -> None:
+    def _on_focus_refresh(self, event=None) -> None:
         """窗口重新获得焦点时自动刷新一次。
 
         典型场景：用户在编辑器里改完文件，切回本软件 —— 无需手动点刷新，
         「变更」页签和文件树就能看到最新状态。
-        用 1 秒节流 + busy 保护，避免连续弹窗/对话框关闭时触发刷新风暴。
+
+        注意：Tk 的 <FocusIn> 会从子控件**冒泡**到主窗口绑定 —— 也就是说
+        点击列表/按钮/输入框都会触发它。这里必须判断事件源是不是窗口本身，
+        否则每次点击都会引发一次刷新，刷新期间的点击又会被忙检查拦下，
+        表现为"按钮要点好几次才生效、日志一直显示忙"。
         """
+        if event is not None and event.widget is not self:
+            return                      # 子控件获得焦点（点击界面内部）→ 不刷新
         if self.git is None or self.busy:
             return
         now = time.time()
